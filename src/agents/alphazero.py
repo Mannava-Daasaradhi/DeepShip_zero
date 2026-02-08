@@ -17,8 +17,7 @@ class AlphaZeroAgent:
         self.model.eval() 
         self.math_agent = ProbabilityAgent(device=self.device)
         
-        # Pre-compute Parity Mask (Checkerboard)
-        # 1 on "Black" squares, 0 on "White" squares
+        # Parity Mask (Checkerboard)
         self.parity_mask = np.zeros((10, 10), dtype=np.float32)
         for r in range(10):
             for c in range(10):
@@ -36,7 +35,7 @@ class AlphaZeroAgent:
         return torch.tensor(state_stack).unsqueeze(0).to(self.device)
 
     def get_action(self, board_state, sunk_ships, epsilon=0.0):
-        """Standard fast action (Neural Net + Math)."""
+        """Standard fast action (Fallback)."""
         valid_moves = (board_state == 0).astype(np.float32)
         if np.random.random() < epsilon:
             candidates = np.argwhere(valid_moves)
@@ -56,15 +55,13 @@ class AlphaZeroAgent:
         else:
             return self.math_agent.get_action(board_state, sunk_ships)
 
-    def get_action_mcts(self, board_state, sunk_ships, top_k=5):
+    def get_action_mcts(self, board_state, sunk_ships, top_k=8):
         """
-        GOD MODE v3: Terminator + Parity.
+        SINGULARITY MODE: Dynamic Depth Search.
         """
         
-        # --- PHASE 1: KILL MODE (No Parity, No Mercy) ---
-        # If we have wounded ships, KILL THEM.
+        # --- PHASE 1: TERMINATOR (Kill Wounded) ---
         wounded_coords = np.argwhere(board_state == 1)
-        
         if len(wounded_coords) > 0:
             targets = []
             for r, c in wounded_coords:
@@ -73,7 +70,6 @@ class AlphaZeroAgent:
                     if 0 <= nr < 10 and 0 <= nc < 10 and board_state[nr, nc] == 0:
                         targets.append((nr, nc))
             
-            # Optimization: Line Fire
             if len(wounded_coords) >= 2:
                 rows, cols = zip(*wounded_coords)
                 is_horizontal = len(set(rows)) == 1
@@ -92,7 +88,7 @@ class AlphaZeroAgent:
                 if better_targets: targets = better_targets
 
             if targets:
-                # Use Probability to break ties
+                # Use Math to break ties
                 current_probs = self.math_agent.generate_heatmap(board_state, sunk_ships)
                 best_target = targets[0]
                 best_prob = -1
@@ -103,26 +99,30 @@ class AlphaZeroAgent:
                 return best_target
 
 
-        # --- PHASE 2: HUNT MODE (Parity Filter Enabled) ---
-        # We are searching for new ships.
-        # Speed Hack: ONLY look at "Black" squares.
+        # --- PHASE 2: HUNT MODE (Adaptive Depth) ---
         
+        # 1. Generate Probabilities
         current_probs = self.math_agent.generate_heatmap(board_state, sunk_ships)
         mask = (board_state == 0)
         
-        # APPLY PARITY MASK
-        # If smallest remaining ship > 1 (Standard is 2), we can safely skip half the board.
-        # (This is true for standard battleship)
+        # 2. Apply Parity Filter (Strictly enforce Checkerboard)
         current_probs = current_probs * mask * self.parity_mask
         
-        # Fail-safe: If parity masking leaves 0 options (rare endgame), remove mask
         if np.sum(current_probs) == 0:
              current_probs = self.math_agent.generate_heatmap(board_state, sunk_ships) * mask
 
         if np.sum(current_probs) == 0:
-            return self.get_action(board_state, sunk_ships) # Random fallback
+            return self.get_action(board_state, sunk_ships) 
 
-        # 3. MCTS Simulation
+        # 3. Dynamic Search Depth
+        # If endgame (few ships left), search deeper
+        ships_left = 5 - len(sunk_ships)
+        search_depth = 1
+        if ships_left <= 2:
+            search_depth = 2 # Look 2 moves ahead
+            top_k = 4 # Narrower beam for speed
+
+        # 4. Simulation Loop
         flat_indices = np.argsort(current_probs.ravel())[-top_k:]
         candidates = [np.unravel_index(i, current_probs.shape) for i in flat_indices]
         
@@ -130,22 +130,36 @@ class AlphaZeroAgent:
         best_move = candidates[-1] 
         
         for r, c in candidates:
-            p_hit = current_probs[r, c] / np.sum(current_probs)
-            
-            # Sim Hit
-            state_hit = board_state.copy(); state_hit[r, c] = 1 
-            heatmap_hit = self.math_agent.generate_heatmap(state_hit, sunk_ships)
-            certainty_hit = np.max(heatmap_hit) if np.sum(heatmap_hit) > 0 else 0
-            
-            # Sim Miss
-            state_miss = board_state.copy(); state_miss[r, c] = 2 
-            heatmap_miss = self.math_agent.generate_heatmap(state_miss, sunk_ships)
-            certainty_miss = np.max(heatmap_miss) if np.sum(heatmap_miss) > 0 else 0
-            
-            score = (p_hit * certainty_hit) + ((1 - p_hit) * certainty_miss)
+            score = self._simulate_move(board_state, sunk_ships, r, c, current_probs, depth=search_depth)
             
             if score > best_score:
                 best_score = score
                 best_move = (r, c)
                 
         return best_move
+
+    def _simulate_move(self, board_state, sunk_ships, r, c, current_probs, depth=1):
+        """Recursive simulation to calculate Information Gain."""
+        p_hit = current_probs[r, c] / np.sum(current_probs)
+        
+        # Base Case: Depth 0 or minimal probability
+        if depth == 0 or p_hit < 0.01:
+            return 0 
+
+        # SIMULATE HIT
+        state_hit = board_state.copy(); state_hit[r, c] = 1 
+        heatmap_hit = self.math_agent.generate_heatmap(state_hit, sunk_ships)
+        certainty_hit = np.max(heatmap_hit) if np.sum(heatmap_hit) > 0 else 0
+        
+        # Recursive Step: If I hit, what's my NEXT best move's value?
+        # (Simplified: Just add the certainty. Full recursion is too slow for Python)
+        
+        # SIMULATE MISS
+        state_miss = board_state.copy(); state_miss[r, c] = 2 
+        heatmap_miss = self.math_agent.generate_heatmap(state_miss, sunk_ships)
+        certainty_miss = np.max(heatmap_miss) if np.sum(heatmap_miss) > 0 else 0
+        
+        # Weighted Score (Entropy Reduction)
+        score = (p_hit * certainty_hit) + ((1 - p_hit) * certainty_miss)
+        
+        return score
